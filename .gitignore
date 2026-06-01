@@ -1,0 +1,13 @@
+# 本地真实配置含飞书 App Secret、用户目录和项目路径，只保留 example 模板入库。
+config/feishu_claude_bot.v2.json
+
+# 运行态输出可能包含会话内容、审批上下文和截图，公开仓库必须排除。
+outputs/
+logs/
+state/
+temp/
+
+# Python 本地缓存和测试缓存无需入库。
+__pycache__/
+*.py[cod]
+.pytest_cache/

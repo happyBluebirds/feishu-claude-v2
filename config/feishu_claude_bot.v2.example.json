@@ -1,0 +1,25 @@
+{
+  "app_id": "cli_xxxxxxxxxxxxxxxxx",
+  "app_secret": "your-feishu-app-secret",
+  "claude_path": "C:\\Users\\YOUR_USER\\.codemoss\\dependencies\\claude-sdk\\node_modules\\@anthropic-ai\\claude-agent-sdk-win32-x64\\claude.exe",
+  "default_cwd": "D:\\code\\your-project",
+  "cwd_aliases": {
+    "main": "D:\\code\\your-project",
+    "demo": "D:\\code\\another-project"
+  },
+  "allowed_chat_ids": [],
+  "permission_mode": "bypassPermissions",
+  "background_permission_mode": "default",
+  "foreground_permission_mode": "default",
+  "default_model": "",
+  "additional_args": [],
+  "state_path": "D:\\code\\feishu-claude-v2-output\\state\\feishu-claude-bot-state.json",
+  "log_path": "D:\\code\\feishu-claude-v2-output\\logs\\feishu-claude-bot.log",
+  "approvals_path": "D:\\code\\feishu-claude-v2-output\\state\\feishu-claude-bot-approvals.json",
+  "permission_hook_log_path": "D:\\code\\feishu-claude-v2-output\\logs\\feishu-claude-permission-hook.log",
+  "turn_hook_log_path": "D:\\code\\feishu-claude-v2-output\\logs\\feishu-claude-turn-hook.log",
+  "autostart_log_path": "D:\\code\\feishu-claude-v2-output\\logs\\feishu-claude-autostart.log",
+  "reply_max_chars": 3500,
+  "pwsh_path": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+  "python_path": "python"
+}
