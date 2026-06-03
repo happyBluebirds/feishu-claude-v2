@@ -1083,8 +1083,6 @@ class FeishuClaudeBot:
                 kernel32.CloseHandle(proc_handle)
 
         def _is_valid(hwnd_cb: int, *, allow_minimized: bool = False) -> bool:
-            if not user32.IsWindowVisible(hwnd_cb):
-                return False
             r = ctypes.wintypes.RECT()
             if not user32.GetWindowRect(hwnd_cb, ctypes.byref(r)):
                 return False
@@ -1092,7 +1090,10 @@ class FeishuClaudeBot:
             h = r.bottom - r.top
             if allow_minimized:
                 # Windows Terminal 会暴露 160x28 的标签页 HWND；这些不是可截图主窗口，不能误收集。
+                # 锁屏时主窗口可能不再被 IsWindowVisible 视为可见；可信进程树内只按尺寸过滤，让 PrintWindow 有机会离屏渲染。
                 return w > 100 and h > 100
+            if not user32.IsWindowVisible(hwnd_cb):
+                return False
             return w > 100 and h > 100
 
         def _is_terminal_window(hwnd_cb: int) -> bool:

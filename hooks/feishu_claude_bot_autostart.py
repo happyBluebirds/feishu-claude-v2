@@ -17,6 +17,7 @@ INTEGRATION_ROOT = Path(__file__).resolve().parents[1]
 CODEX_ROOT = INTEGRATION_ROOT.parents[1]
 DEFAULT_CONFIG_PATH = INTEGRATION_ROOT / "config" / "feishu_claude_bot.v2.json"
 DEFAULT_LOG_PATH = CODEX_ROOT / "outputs" / "feishu-claude-v2" / "logs" / "feishu-claude-autostart.log"
+DEFAULT_LOCK_STALE_SECONDS = 60
 
 
 @dataclass
@@ -54,6 +55,52 @@ def log_event(log_path: Path, message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(f"[{timestamp}] {message}\n")
+
+
+def acquire_startup_lock(lock_path: Path, log_path: Path, timeout_seconds: float = 15.0) -> bool:
+    """Acquire a short-lived cross-process lock for Claude SessionStart autostart.
+
+    Args:
+        lock_path: File path used as an atomic startup lock.
+        log_path: Diagnostic log path for skipped or stale locks.
+        timeout_seconds: Maximum wait time before skipping this autostart attempt.
+
+    Returns:
+        True when the current process owns the startup lock; False when another
+        hook process is already handling the health check and restart.
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            # 多个 Claude 窗口会并发触发 SessionStart；用 O_EXCL 保证同一时刻只有一个进程重启 bot。
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"pid={os.getpid()} created_at={time.time()}\n")
+            return True
+        except FileExistsError:
+            try:
+                # 上次异常退出可能留下锁文件；超过保守阈值后清理，避免永久阻塞自动拉起。
+                if time.time() - lock_path.stat().st_mtime > DEFAULT_LOCK_STALE_SECONDS:
+                    lock_path.unlink(missing_ok=True)
+                    log_event(log_path, f"removed stale SessionStart lock: {lock_path}")
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+    log_event(log_path, "skip SessionStart autostart: another hook is handling startup")
+    return False
+
+
+def release_startup_lock(lock_path: Path) -> None:
+    """Release the SessionStart startup lock if it still exists."""
+
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def is_bot_running(bot_script_path: Path, pwsh_path: str) -> bool:
@@ -172,40 +219,46 @@ def ensure_bot_running(config_path: Path) -> None:
     config = AutoStartConfig.load(config_path)
     log_path = Path(config.log_path)
     state_path = Path(config.state_path)
-    bot_was_running = is_bot_running(bot_script_path, config.pwsh_path)
-    bot_is_healthy = bot_was_running and is_bot_healthy(state_path)
+    lock_path = state_path.parent / "feishu-claude-autostart.lock"
+    if not acquire_startup_lock(lock_path, log_path):
+        return
+    try:
+        bot_was_running = is_bot_running(bot_script_path, config.pwsh_path)
+        bot_is_healthy = bot_was_running and is_bot_healthy(state_path)
 
-    if not bot_is_healthy:
-        # 进程不存在或健康检查超时，都需要重新拉起。
-        if bot_was_running:
-            log_event(log_path, "bot process running but unhealthy; restarting")
-        creation_flags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        # SessionStart runs on Claude window creation; keep bot startup detached so
-        # the Claude UI is not blocked by a long-running Feishu connection process.
-        subprocess.Popen(
-            [
-                config.python_path,
-                str(bootstrap_script),
-                str(bot_script_path),
-                "--config",
-                str(config_path),
-            ],
-            cwd=str(script_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-        )
-        log_event(log_path, "bot process was not running or unhealthy; attempted detached startup")
-    else:
-        log_event(log_path, "bot process already running and healthy")
+        if not bot_is_healthy:
+            # 进程不存在或健康检查超时，都需要重新拉起。
+            if bot_was_running:
+                log_event(log_path, "bot process running but unhealthy; restarting")
+            creation_flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            # SessionStart runs on Claude window creation; keep bot startup detached so
+            # the Claude UI is not blocked by a long-running Feishu connection process.
+            subprocess.Popen(
+                [
+                    config.python_path,
+                    str(bootstrap_script),
+                    str(bot_script_path),
+                    "--config",
+                    str(config_path),
+                ],
+                cwd=str(script_dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+            )
+            log_event(log_path, "bot process was not running or unhealthy; attempted detached startup")
+        else:
+            log_event(log_path, "bot process already running and healthy")
 
-    latest_chat_id = get_latest_chat_id(state_path)
-    notice = "Claude 本地会话已启动，飞书助手已在线。" if bot_is_healthy else "Claude 本地会话已启动，飞书助手已自动拉起。"
-    launch_notice_sender(config_path, latest_chat_id, notice, log_path, config.python_path)
+        latest_chat_id = get_latest_chat_id(state_path)
+        notice = "Claude 本地会话已启动，飞书助手已在线。" if bot_is_healthy else "Claude 本地会话已启动，飞书助手已自动拉起。"
+        launch_notice_sender(config_path, latest_chat_id, notice, log_path, config.python_path)
+    finally:
+        release_startup_lock(lock_path)
 
 
 def main() -> int:
