@@ -81,6 +81,8 @@ def is_bot_running(bot_script_path: Path, pwsh_path: str) -> bool:
         encoding="utf-8",
         errors="replace",
         capture_output=True,
+        # SessionStart 健康检查会在打开 Claude 窗口时执行；隐藏 pwsh 探测进程，避免桌面出现一闪而过的控制台窗口。
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         check=False,
     )
     return bool((result.stdout or "").strip())

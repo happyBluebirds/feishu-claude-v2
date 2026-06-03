@@ -18,7 +18,7 @@ import pytest
 MODULE_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(MODULE_DIR))
 
-from feishu_claude_bot import BotConfig, BotState, FeishuClaudeBot
+from feishu_claude_bot import BotConfig, BotState, CommandRouter, FeishuClaudeBot
 
 DEFAULT_CWD = "D:\\code\\test"
 CHAT_ID = "oc_test_chat_001"
@@ -82,7 +82,9 @@ class TestableBot(FeishuClaudeBot):
         self.jobs: dict[str, Any] = {}
         self.jobs_lock = threading.Lock()
         self.recent_control_commands: dict[tuple[str, str], float] = {}
+        self.recent_plain_text_commands: dict[tuple[str, str], float] = {}
         self.recent_message_ids: dict[str, float] = {}
+        self.command_router = CommandRouter()
 
     # --- Stubbed methods ---
 
@@ -115,6 +117,9 @@ class TestableBot(FeishuClaudeBot):
 
     def _refresh_chat_runtime_state(self, chat_id: str) -> dict[str, Any]:
         return self.state.get_chat(chat_id, self.config.default_cwd)
+
+    def _resolve_realtime_window_targets(self) -> list[dict[str, Any]]:
+        return []
 
     def log(self, message: str) -> None:
         pass  # silent in tests
@@ -326,18 +331,15 @@ class TestCloseSession:
 # ---------------------------------------------------------------------------
 
 class TestBackwardCompatRouting:
-    def test_run_queues_to_active_session(self, bot):
+    def test_run_prefixed_text_requires_window(self, bot):
         bot.send("运行 fix the bug")
-        task = bot.last_task()
-        assert task is not None
-        assert task.prompt == "fix the bug"
-        assert task.continue_mode is False
+        assert bot.last_task() is None
+        assert "当前没有可接管的 Claude 前台窗口" in bot.last_reply()
 
-    def test_continue_queues_to_active_session(self, bot):
+    def test_continue_requires_window(self, bot):
         bot.send("继续")
-        task = bot.last_task()
-        assert task is not None
-        assert task.continue_mode is True
+        assert bot.last_task() is None
+        assert "当前没有可接管的 Claude 前台窗口" in bot.last_reply()
 
     def test_status_shows_active_session(self, bot):
         bot.send("状态")
@@ -436,9 +438,8 @@ class TestCommandParsing:
 
     def test_unknown_command_falls_through(self, bot):
         bot.send("do something unrelated")
-        task = bot.last_task()
-        assert task is not None
-        assert task.prompt == "do something unrelated"
+        assert bot.last_task() is None
+        assert "当前没有可接管的 Claude 前台窗口" in bot.last_reply()
 
     def test_screenshot_not_forwarded_to_claude(self, bot):
         bot.send("截图 桌面")

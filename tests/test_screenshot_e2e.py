@@ -9,9 +9,18 @@ that causes "窗口尺寸无效，可能已最小化".
 
 import ctypes
 import ctypes.wintypes
+import os
 import time
 import sys
 from pathlib import Path
+
+import pytest
+
+if os.environ.get("FEISHU_CLAUDE_RUN_GUI_E2E") != "1":
+    pytest.skip(
+        "Win32 screenshot E2E creates real GUI windows; set FEISHU_CLAUDE_RUN_GUI_E2E=1 to run it.",
+        allow_module_level=True,
+    )
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32

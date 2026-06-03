@@ -54,8 +54,11 @@ def main() -> None:
     bot.send_image = lambda chat_id, image_path: sent_messages.append((chat_id, f"IMAGE:{image_path.name}"))
     bot._process_exists = lambda pid: int(pid) > 0
     bot._ensure_foreground_binding = lambda chat_id, chat_state: chat_state  # type: ignore[assignment]
-    bot._capture_window_screenshot = lambda pid: screenshot_calls.append(pid) or (  # type: ignore[assignment]
-        Path(config.state_path).resolve().parent.parent / "temp" / "screenshots" / f"mock-{pid}.png"
+    bot._resolve_claude_screenshot_windows = (  # type: ignore[assignment]
+        lambda chat_id, chat_state: (chat_state, int(chat_state.get("foreground_pid") or 0), [int(chat_state.get("foreground_pid") or 0)])
+    )
+    bot._capture_hwnd_screenshot = lambda hwnd, tag="": screenshot_calls.append(hwnd) or (  # type: ignore[assignment]
+        Path(config.state_path).resolve().parent.parent / "temp" / "screenshots" / f"mock-{hwnd}.png"
     )
     bot._send_command_to_existing_foreground_session = (
         lambda chat_id, prompt, pid: foreground_commands.append((pid, prompt))

@@ -1290,8 +1290,11 @@ class FeishuClaudeBot:
         """Capture the current primary desktop screen for remote troubleshooting."""
 
         screenshot_dir = self._get_temp_dir("screenshots")
-        screenshot_path = screenshot_dir / f"desktop-{int(time.time())}.png"
-        script_path = screenshot_dir / f"capture-desktop-{int(time.time())}.ps1"
+        timestamp_ns = time.time_ns()
+        screenshot_path = screenshot_dir / f"desktop-{timestamp_ns}.png"
+        script_path = screenshot_dir / f"capture-desktop-{timestamp_ns}.ps1"
+        # 截图文件名必须每次唯一；同秒重复截图时绝不能复用旧文件，否则飞书可能上传上一张历史图片。
+        screenshot_path.unlink(missing_ok=True)
         script = r"""
 param(
   [string]$OutputPath
@@ -1354,7 +1357,9 @@ try {
 
         screenshot_dir = self._get_temp_dir("screenshots")
         suffix = f"-{tag}" if tag else ""
-        screenshot_path = screenshot_dir / f"claude-window{suffix}-{int(time.time())}.bmp"
+        screenshot_path = screenshot_dir / f"claude-window{suffix}-{time.time_ns()}.bmp"
+        # 窗口截图可能被用户连续触发；写入前删除同名残留可避免截图失败后误发旧文件。
+        screenshot_path.unlink(missing_ok=True)
 
         user32 = ctypes.windll.user32
         # 截图必须基于实时窗口状态；Windows Terminal 最小化时 PrintWindow 无法正确渲染
@@ -1763,6 +1768,55 @@ try {
         if result.returncode != 0:
             raise RuntimeError(self._summarize_result(result.stderr or result.stdout or "WINDOW_SEND_FAILED", 500))
 
+    def _send_text_to_managed_foreground_if_available(self, chat_id: str, text: str) -> bool:
+        """Send text to the saved managed foreground session when it is still usable.
+
+        Args:
+            chat_id: Feishu chat id.
+            text: Text to send into Claude.
+
+        Returns:
+            True when a managed foreground session accepted the text; otherwise False.
+        """
+
+        chat_state = self._refresh_chat_runtime_state(chat_id)
+        foreground_pid = chat_state.get("foreground_pid") or chat_state.get("active_pid")
+        if (
+            not foreground_pid
+            or not self._process_exists(foreground_pid)
+            or chat_state.get("status") not in {"foreground_opened", "foreground_busy", "foreground_running"}
+        ):
+            return False
+        if self._current_foreground_settings_stale(chat_state):
+            # 当前前台窗口的启动参数无法热更新；继续复用窗口时只标记“下次新窗口生效”，避免误杀正在看的会话。
+            self.state.update_chat(
+                chat_id,
+                {"runtime_settings_pending_restart": True},
+                self.config.default_cwd,
+            )
+        # 已托管的前台窗口是飞书普通文本的主路径；它内部会重新定位真实终端窗口，降低 HWND 过期导致的发送失败。
+        self._send_command_to_existing_foreground_session(chat_id, text, int(foreground_pid))
+        return True
+
+    def _is_stopped_configuration_state(self, chat_id: str) -> bool:
+        """Tell whether plain text should be blocked after an explicit stop.
+
+        Args:
+            chat_id: Feishu chat id.
+
+        Returns:
+            True when the active session is stopped and no managed foreground process remains.
+        """
+
+        chat_state = self.state.get_chat(chat_id, self.config.default_cwd)
+        # 停止后只允许目录/模型/权限/显式启动命令改变状态；普通自然语言不能再次隐式启动本机执行。
+        return (
+            chat_state.get("status") == "stopped"
+            and not chat_state.get("managed_session")
+            and not chat_state.get("active_pid")
+            and not chat_state.get("foreground_pid")
+        )
+
     def _send_text_to_active_window_or_prompt(self, chat_id: str, text: str) -> bool:
         """Send plain Feishu text to the currently selected realtime window.
 
@@ -1774,8 +1828,16 @@ try {
             True when the text was sent or a prompt was sent; callers should stop routing.
         """
 
+        chat_state = self.state.get_chat(chat_id, self.config.default_cwd)
+        active_hwnd = chat_state.get("active_window_hwnd")
+        has_window_snapshot = bool(chat_state.get("last_window_targets"))
+        if (not active_hwnd or not has_window_snapshot) and self._send_text_to_managed_foreground_if_available(chat_id, text):
+            return True
+
         target = self._resolve_active_window_target(chat_id)
         if not target:
+            if self._send_text_to_managed_foreground_if_available(chat_id, text):
+                return True
             return True
         try:
             self._send_command_to_foreground_hwnd(int(target["hwnd"]), text)
@@ -4327,6 +4389,7 @@ try {
                         "权限 acceptEdits",
                         "权限 bypassPermissions",
                         "权限 跟随配置",
+                        "说明：bypassPermissions 会为新开的 Claude 前台/后台进程追加危险跳过参数，只能在可信聊天和本机环境中使用。",
                         "",
                         "飞书授权回复：",
                         "授权：查看所有待授权项目（会展开问题和可选方案）",
@@ -4466,9 +4529,45 @@ try {
             self.send_text(chat_id, "请提供目录路径，例如：目录 D:\\code\\5a\\unimis-ry-cloud")
             return
 
-        # v2 日常入口改为窗口驱动；裸“运行”不再代表后台任务，避免用户误触后开出无意义后台会话。
+        stopped_launch_commands = {"/run", "运行", "/fgrun", "前台运行", "/fgcontinue", "前台继续"}
+        if (
+            self._is_stopped_configuration_state(chat_id)
+            and text not in stopped_launch_commands
+            and not text.startswith(("新窗口继续", "/newcontinue", "新窗口运行", "/newrun"))
+        ):
+            self.send_text(
+                chat_id,
+                self._build_sectioned_message(
+                    "当前处于已停止后的配置态",
+                    [
+                        "说明：普通文本不会自动启动 Claude，避免停止后误触继续执行。",
+                        "如需重新接管本机 Claude，请使用显式启动命令。",
+                    ],
+                    ["运行", "前台运行", "新窗口继续", "状态"],
+                ),
+            )
+            return
+
+        # v2 日常入口改为窗口驱动；裸“运行”作为显式启动入口，不再把普通文本误判成后台任务。
         if text in {"/run", "运行"}:
-            self.send_text(chat_id, "“运行”已取消后台语义。请直接发送要给 Claude 的内容，或使用：新窗口运行 <任务>。")
+            chat_state = self._refresh_chat_runtime_state(chat_id)
+            foreground_pid = chat_state.get("foreground_pid") or chat_state.get("active_pid")
+            if foreground_pid and self._process_exists(foreground_pid):
+                # 用户点“运行”时若已有可接管窗口，只提示复用，避免重复新开前台 Claude。
+                self.send_text(
+                    chat_id,
+                    self._build_sectioned_message(
+                        "当前已有可接管前台窗口",
+                        [
+                            f"目录：{chat_state.get('cwd')}",
+                            f"窗口进程：{foreground_pid}",
+                            "说明：请直接发送任务文本，或回复“继续”把指令送入当前窗口。",
+                        ],
+                        ["继续", "窗口列表", "新窗口运行 <任务>", "状态"],
+                    ),
+                )
+                return
+            self._queue_claude_task(chat_id, "继续", continue_mode=True, foreground=True)
             return
 
         if text in {"/bgrun", "后台运行"}:
@@ -4486,7 +4585,8 @@ try {
             return
 
         if text in {"/fgcontinue", "前台继续"}:
-            self._queue_claude_task(chat_id, "继续", continue_mode=True, foreground=True, route_to_existing_foreground=False)
+            # “新窗口继续”才负责强制重开；“前台继续”应复用当前可见窗口，避免用户刚接管的会话被新窗口打断。
+            self._send_text_to_active_window_or_prompt(chat_id, "继续")
             return
 
         if text in {"/bgcontinue", "后台继续"}:
@@ -4503,7 +4603,8 @@ try {
                 self.send_text(chat_id, "当前没有可接管的 Claude 前台窗口。请先回复“前台继续”或“前台运行”。")
                 return
             try:
-                self.foreground_adapter.send_hotkey(int(foreground_pid), "shift+tab")
+                # 热键发送保留主类包装入口，便于回归测试和后续 Windows 兼容补丁替换底层实现。
+                self._send_hotkey_to_foreground_window(int(foreground_pid), "shift+tab")
                 self.send_text(chat_id, "已向当前 Claude 前台窗口发送 Shift+Tab。")
             except Exception as exc:
                 self.log(f"foreground hotkey failed chat={chat_id} pid={foreground_pid} key=shift+tab error={exc}")
@@ -4521,7 +4622,8 @@ try {
                 self.send_text(chat_id, "当前没有可接管的 Claude 前台窗口。请先回复“前台继续”或“前台运行”。")
                 return
             try:
-                self.foreground_adapter.send_hotkey(int(foreground_pid), hotkey)
+                # 自定义热键同样走主类包装入口，保证测试桩和真实发送链路保持同一层边界。
+                self._send_hotkey_to_foreground_window(int(foreground_pid), hotkey)
                 self.send_text(chat_id, f"已向当前 Claude 前台窗口发送按键：{hotkey}")
             except Exception as exc:
                 self.log(f"foreground hotkey failed chat={chat_id} pid={foreground_pid} key={hotkey} error={exc}")
@@ -4874,7 +4976,8 @@ try {
         for prefix in ("/fgcontinue ", "前台继续 "):
             if text.startswith(prefix):
                 prompt = text[len(prefix):].strip() or "继续"
-                self._queue_claude_task(chat_id, prompt, continue_mode=True, foreground=True, route_to_existing_foreground=False)
+                # 带补充说明的“前台继续”仍是当前窗口输入；显式开新窗口请使用“新窗口继续”。
+                self._send_text_to_active_window_or_prompt(chat_id, prompt)
                 return
 
         for prefix in ("/bgrun ", "后台运行 ", "/bgcontinue ", "后台继续 "):
