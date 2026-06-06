@@ -106,6 +106,19 @@ CLAUDE_SUMMARY_ANCHORS = (
 _TERMINAL_PROCESS_NAMES = frozenset({"windowsterminal", "openconsole", "pwsh", "powershell"})
 
 
+def _hidden_subprocess_creationflags() -> int:
+    """Return Windows subprocess flags for helper commands that must not flash a console window.
+
+    Returns:
+        A `creationflags` integer. It is zero on non-Windows runtimes and
+        `CREATE_NO_WINDOW` on Windows, so helper probes stay invisible while
+        preserving normal process behavior.
+    """
+
+    # 飞书消息触发的 PowerShell/CIM/截图辅助命令都属于后台动作；统一隐藏控制台可消除“收到消息一闪”的桌面干扰。
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _find_visible_window_by_title(title_part: str, *, require_terminal_process: bool = True) -> int:
     """Return the HWND of a visible window whose title contains *title_part*.
 
@@ -800,8 +813,9 @@ class FeishuClaudeBot:
         """Capture a visible Windows window for a managed foreground Claude process.
 
         Uses PrintWindow with PW_RENDERFULLCONTENT so the capture works even when
-        the screen is locked or the monitor is off.  Falls back to CopyFromScreen
-        (screen DC BitBlt) if PrintWindow fails.
+        the screen is locked or the monitor is off. It never restores or activates
+        the target window, because remote screenshot requests must not flash the
+        local desktop.
         """
 
         # Ensure we get real physical pixel coordinates on high-DPI displays.
@@ -818,32 +832,66 @@ class FeishuClaudeBot:
         if not hwnd:
             raise RuntimeError("没有找到可截图的 Claude Code 终端窗口，已取消截图，避免误发其他窗口。")
 
-        user32 = ctypes.windll.user32
-        # PrintWindow 对最小化窗口无法正确渲染，先恢复再截图。
-        # SW_RESTORE(9) 确保窗口完全恢复。
-        user32.ShowWindow(hwnd, 9)
-        time.sleep(0.5)
-
-        rect = ctypes.wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            raise RuntimeError("读取窗口位置失败")
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-        if width <= 0 or height <= 0:
-            raise RuntimeError("窗口尺寸无效，可能已最小化")
+        width, height = self._get_window_capture_size(hwnd)
 
         img = self._print_window_to_image(hwnd, width, height)
         if img is None:
             # PrintWindow 失败时重试一次（窗口可能还在渲染中）。
-            time.sleep(0.5)
+            time.sleep(0.2)
             img = self._print_window_to_image(hwnd, width, height)
         if img is None:
             raise RuntimeError("窗口截图失败：PrintWindow 未成功")
+        if self._is_probably_blank_image(img):
+            # Windows Terminal 最小化或显卡合成层暂不可读时 PrintWindow 会返回纯色图；宁可提示恢复窗口，也不弹窗强制恢复。
+            raise RuntimeError("窗口截图失败：当前窗口可能已最小化或暂不可离屏渲染，请恢复窗口后重试，或回复“截图 桌面”。")
 
         img.save(str(screenshot_path), "BMP")
         return screenshot_path
 
     # -- low-level screenshot helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _get_window_capture_size(hwnd: int) -> tuple[int, int]:
+        """Read a window's capture size without changing its foreground/minimized state.
+
+        Args:
+            hwnd: Native Windows HWND.
+
+        Returns:
+            Width and height in physical pixels.
+        """
+
+        user32 = ctypes.windll.user32
+        is_minimized = bool(user32.IsIconic(hwnd))
+        is_hidden = not bool(user32.IsWindowVisible(hwnd))
+        if not is_minimized and not is_hidden:
+            rect = ctypes.wintypes.RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                if width > 100 and height > 100:
+                    return width, height
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_uint32),
+                ("flags", ctypes.c_uint32),
+                ("showCmd", ctypes.c_uint32),
+                ("ptMinPosition", ctypes.wintypes.POINT),
+                ("ptMaxPosition", ctypes.wintypes.POINT),
+                ("rcNormalPosition", ctypes.wintypes.RECT),
+            ]
+
+        placement = WINDOWPLACEMENT()
+        placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+            normal = placement.rcNormalPosition
+            width = normal.right - normal.left
+            height = normal.bottom - normal.top
+            if width > 100 and height > 100:
+                # 最小化窗口的实时矩形可能退化，使用 rcNormalPosition 仅用于离屏画布尺寸，不改变窗口状态。
+                return width, height
+        raise RuntimeError("窗口尺寸无效或句柄已失效，已取消截图，避免误发其他窗口。")
 
     @staticmethod
     def _build_process_tree() -> tuple[dict[int, int], dict[int, list[int]]]:
@@ -1002,6 +1050,8 @@ class FeishuClaudeBot:
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
+                # 截图枚举只需要后台读取进程表；隐藏 PowerShell，避免飞书消息触发控制台闪烁。
+                creationflags=_hidden_subprocess_creationflags(),
                 check=False,
             )
             if metadata_result.returncode == 0 and (metadata_result.stdout or "").strip():
@@ -1083,6 +1133,9 @@ class FeishuClaudeBot:
                 kernel32.CloseHandle(proc_handle)
 
         def _is_valid(hwnd_cb: int, *, allow_minimized: bool = False) -> bool:
+            if not user32.IsWindow(hwnd_cb):
+                # EnumWindows 回调期间窗口也可能关闭；提前剔除失效 HWND，避免截图阶段再报“读取窗口位置失败”。
+                return False
             r = ctypes.wintypes.RECT()
             if not user32.GetWindowRect(hwnd_cb, ctypes.byref(r)):
                 return False
@@ -1274,6 +1327,31 @@ class FeishuClaudeBot:
         return img
 
     @staticmethod
+    def _is_probably_blank_image(img: Any) -> bool:
+        """Tell whether a captured window image is likely an unusable blank frame.
+
+        Args:
+            img: PIL image returned by `_print_window_to_image`.
+
+        Returns:
+            True when the image has almost no pixel variance and should not be
+            sent as a successful screenshot.
+        """
+
+        try:
+            from PIL import ImageStat
+        except ImportError:
+            return False
+
+        try:
+            thumb = img.resize((64, 64))
+            stat = ImageStat.Stat(thumb)
+        except Exception:
+            return False
+        # PrintWindow 对最小化/不可合成窗口常返回全黑或全白图；标准差极低时判为不可用截图。
+        return max(stat.stddev or [0]) < 1.0
+
+    @staticmethod
     def _copy_screen_region_to_image(left: int, top: int, width: int, height: int):
         """Fallback: capture a screen region via CopyFromScreen (BitBlt on screen DC).
 
@@ -1338,6 +1416,8 @@ try {
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            # 桌面截图脚本由机器人后台执行；隐藏 pwsh 宿主，避免远程截图时额外弹窗。
+            creationflags=_hidden_subprocess_creationflags(),
             check=False,
         )
         try:
@@ -1349,7 +1429,15 @@ try {
         return screenshot_path
 
     def _capture_hwnd_screenshot(self, hwnd: int, tag: str = "") -> Path:
-        """Capture a specific window handle. Returns the path to the BMP file."""
+        """Capture a specific window handle without activating or restoring it.
+
+        Args:
+            hwnd: Native Windows HWND to capture.
+            tag: Optional filename tag for correlating logs with a PID/window index.
+
+        Returns:
+            Path to the generated BMP file.
+        """
 
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -1363,26 +1451,20 @@ try {
         screenshot_path.unlink(missing_ok=True)
 
         user32 = ctypes.windll.user32
-        # 截图必须基于实时窗口状态；Windows Terminal 最小化时 PrintWindow 无法正确渲染
-        # DirectX 内容，需要先恢复窗口再截图。SW_RESTORE(9) 确保窗口完全恢复。
-        user32.ShowWindow(hwnd, 9)
-        time.sleep(0.5)
-
-        rect = ctypes.wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            raise RuntimeError("读取窗口位置失败")
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-        if width <= 0 or height <= 0:
-            raise RuntimeError("窗口尺寸无效，可能已最小化")
+        if not user32.IsWindow(hwnd):
+            raise RuntimeError("窗口句柄已失效，请回复“窗口列表”刷新后重试。")
+        width, height = self._get_window_capture_size(hwnd)
 
         img = self._print_window_to_image(hwnd, width, height)
         if img is None:
             # PrintWindow 失败时重试一次（窗口可能还在渲染中）。
-            time.sleep(0.5)
+            time.sleep(0.2)
             img = self._print_window_to_image(hwnd, width, height)
         if img is None:
             raise RuntimeError("窗口截图失败：PrintWindow 未成功")
+        if self._is_probably_blank_image(img):
+            # 这里不再恢复窗口，避免飞书远程截图打断本机；最小化窗口请由用户显式恢复或改走桌面截图。
+            raise RuntimeError("窗口截图失败：当前窗口可能已最小化或暂不可离屏渲染，请恢复窗口后重试，或回复“截图 桌面”。")
 
         img.save(str(screenshot_path), "BMP")
         return screenshot_path
@@ -1760,6 +1842,8 @@ try {
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            # HWND 注入脚本会自行激活目标窗口；pwsh 宿主必须隐藏，避免出现第二个闪烁控制台。
+            creationflags=_hidden_subprocess_creationflags(),
             check=False,
         )
         try:
@@ -2555,6 +2639,8 @@ try {
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            # 旧前台进程回收只做进程表查询；隐藏 PowerShell 查询窗口，避免收到消息时闪烁。
+            creationflags=_hidden_subprocess_creationflags(),
             check=False,
         )
         pid_text = (result.stdout or "").strip()
@@ -3061,6 +3147,8 @@ try {
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            # 发送到已托管前台窗口时只允许目标终端被激活，辅助 pwsh 自身保持隐藏。
+            creationflags=_hidden_subprocess_creationflags(),
             check=False,
         )
         try:
@@ -3094,6 +3182,8 @@ try {
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            # watcher 存活探测属于后台健康检查，不能在桌面闪出控制台窗口。
+            creationflags=_hidden_subprocess_creationflags(),
             check=False,
         )
         return bool((result.stdout or "").strip())
@@ -3311,6 +3401,8 @@ try {
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            # 前台快捷键脚本只负责投递键盘事件；隐藏 pwsh 宿主，避免暂停/热键操作时闪烁。
+            creationflags=_hidden_subprocess_creationflags(),
             check=False,
         )
         try:
@@ -3349,11 +3441,21 @@ try {
         approvals_path.parent.mkdir(parents=True, exist_ok=True)
         approvals_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _find_pending_approvals(self, chat_id: str) -> list[tuple[str, dict[str, Any]]]:
-        """Return pending approval requests for one chat, newest first."""
+    def _find_pending_approvals_in_requests(
+        self,
+        requests: dict[str, Any],
+        chat_id: str,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return pending approval requests from an already loaded request map.
 
-        state = self._load_approvals_state()
-        requests = state.get("requests", {})
+        Args:
+            requests: Approval request map loaded from the shared JSON state.
+            chat_id: Feishu chat id whose pending requests should be listed.
+
+        Returns:
+            Pending approval request tuples sorted newest first.
+        """
+
         matches = [
             (request_id, request)
             for request_id, request in requests.items()
@@ -3361,6 +3463,13 @@ try {
         ]
         matches.sort(key=lambda item: float(item[1].get("created_at", 0)), reverse=True)
         return matches
+
+    def _find_pending_approvals(self, chat_id: str) -> list[tuple[str, dict[str, Any]]]:
+        """Return pending approval requests for one chat, newest first."""
+
+        state = self._load_approvals_state()
+        requests = state.get("requests", {})
+        return self._find_pending_approvals_in_requests(requests, chat_id)
 
     @staticmethod
     def _clip_approval_text(value: Any, limit: int = 220) -> str:
@@ -3716,7 +3825,9 @@ try {
             return False
 
         state = self._load_approvals_state()
-        pending_matches = self._find_pending_approvals(chat_id)
+        requests = state.get("requests", {})
+        # 选项答案必须写回本次加载的 state；重新读取一份 pending 会导致修改落在副本上，保存后仍是 pending。
+        pending_matches = self._find_pending_approvals_in_requests(requests, chat_id)
         ask_matches = [
             (request_id, request)
             for request_id, request in pending_matches
@@ -3887,7 +3998,8 @@ try {
     ) -> tuple[str | None, dict[str, Any] | None, str]:
         """Resolve a pending approval by optional full/partial id or newest request."""
 
-        pending_matches = self._find_pending_approvals(chat_id)
+        # request 必须来自调用方即将保存的 requests 映射，避免授权决策写到另一份 JSON 快照。
+        pending_matches = self._find_pending_approvals_in_requests(requests, chat_id)
         if not pending_matches:
             return None, None, ""
         normalized_id = self._normalize_approval_request_id(request_id)
@@ -3918,12 +4030,14 @@ try {
 
     def _resolve_approval_requests_by_indexes(
         self,
+        requests: dict[str, Any],
         chat_id: str,
         indexes: list[int],
     ) -> tuple[list[tuple[int, str, dict[str, Any]]], str]:
         """Resolve multiple pending approval requests by 1-based list indexes."""
 
-        pending_matches = self._find_pending_approvals(chat_id)
+        # 批量授权同样只在调用方持有的 requests 快照里解析，保证后续 save 能持久化状态变更。
+        pending_matches = self._find_pending_approvals_in_requests(requests, chat_id)
         if not pending_matches:
             return [], ""
         selected_items: list[tuple[int, str, dict[str, Any]]] = []
@@ -3950,7 +4064,9 @@ try {
         """Apply the same approval decision to every pending request in this chat."""
 
         state = self._load_approvals_state()
-        pending_matches = self._find_pending_approvals(chat_id)
+        requests = state.get("requests", {})
+        # “同意/全部授权”会直接改状态并保存，必须使用同一份 requests 对象，避免只修改了临时快照。
+        pending_matches = self._find_pending_approvals_in_requests(requests, chat_id)
         if not pending_matches:
             self.send_text(chat_id, "当前没有待处理的授权请求。")
             return True
@@ -3972,7 +4088,8 @@ try {
         if len(indexes) <= 1:
             return False
         state = self._load_approvals_state()
-        selected_items, resolve_error = self._resolve_approval_requests_by_indexes(chat_id, indexes)
+        requests = state.get("requests", {})
+        selected_items, resolve_error = self._resolve_approval_requests_by_indexes(requests, chat_id, indexes)
         if not selected_items:
             self.send_text(chat_id, resolve_error or "当前没有待处理的授权请求。")
             return True
@@ -4356,7 +4473,7 @@ try {
                         "帮助",
                         "我是谁",
                         "新窗口继续 [补充指令]",
-                        "新窗口运行 <任务>",
+                        "新窗口运行 [任务]",
                         "窗口列表",
                         "切换到窗口1",
                         "继续",
@@ -4564,7 +4681,7 @@ try {
                             f"窗口进程：{foreground_pid}",
                             "说明：请直接发送任务文本，或回复“继续”把指令送入当前窗口。",
                         ],
-                        ["继续", "窗口列表", "新窗口运行 <任务>", "状态"],
+                        ["继续", "窗口列表", "新窗口运行 [任务]", "状态"],
                     ),
                 )
                 return
@@ -4928,7 +5045,15 @@ try {
             if text == prefix or text.startswith(prefix + " "):
                 prompt = text[len(prefix):].strip()
                 if not prompt:
-                    self.send_text(chat_id, "请提供任务内容，例如：新窗口运行 检查当前项目。")
+                    # 无参数“新窗口运行”是用户显式要求开新 Claude 窗口；默认只开空白前台窗口，等待后续飞书/本机输入。
+                    self._queue_claude_task(
+                        chat_id,
+                        "",
+                        continue_mode=False,
+                        foreground=True,
+                        route_to_existing_foreground=False,
+                        open_foreground_only=True,
+                    )
                     return
                 # 新窗口运行是新的上下文入口，不能复用已有前台窗口，也不能自动 continue。
                 self._queue_claude_task(chat_id, prompt, continue_mode=False, foreground=True, route_to_existing_foreground=False)
@@ -5203,6 +5328,8 @@ try {
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
+                # Start-Process 会打开真正的前台 Claude 窗口；外层 pwsh 只负责取 PID，必须隐藏。
+                creationflags=_hidden_subprocess_creationflags(),
                 check=False,
             )
             if result.returncode != 0:
@@ -5372,7 +5499,8 @@ try {
             env["FEISHU_CLAUDE_BOT_CONFIG_PATH"] = str(INTEGRATION_ROOT / "config" / "feishu_claude_bot.v2.json")
             # 后台 print 模式由 bot 自己汇总最终输出；Stop hook 只在前台场景负责补通知。
             env["FEISHU_CLAUDE_BOT_EXECUTION_MODE"] = "background"
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            # 后台 Claude --print 不需要任何本机可见窗口；同时保留进程组，便于“停止”整棵进程树。
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | _hidden_subprocess_creationflags()
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -5576,6 +5704,8 @@ try {
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
+                # taskkill 是后台停止动作；隐藏控制台窗口，避免远程停止时桌面闪烁。
+                creationflags=_hidden_subprocess_creationflags(),
                 check=False,
             )
         elif not self._is_managed_status(chat_state.get("status")) and not chat_state.get("managed_session"):

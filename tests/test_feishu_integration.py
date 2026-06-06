@@ -8,6 +8,7 @@ handle_command, and asserts on captured replies and state changes.
 import json
 import sys
 import threading
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,13 @@ import pytest
 
 MODULE_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(MODULE_DIR))
+
+if "lark_oapi" not in sys.modules:
+    # 单元测试会完全替换飞书发送入口；这里仅提供导入桩，避免离线环境缺 SDK 时无法收集测试。
+    lark_stub = types.ModuleType("lark_oapi")
+    lark_stub.LogLevel = types.SimpleNamespace(INFO="INFO")
+    lark_stub.Client = types.SimpleNamespace(builder=lambda: MagicMock())
+    sys.modules["lark_oapi"] = lark_stub
 
 from feishu_claude_bot import BotConfig, BotState, CommandRouter, FeishuClaudeBot
 
@@ -493,6 +501,125 @@ class TestStoppedState:
         task = bot.last_task()
         if task is not None:
             assert task.prompt != "some random text"
+
+
+# ---------------------------------------------------------------------------
+# Foreground launch shortcuts
+# ---------------------------------------------------------------------------
+
+class TestForegroundLaunchShortcuts:
+    def test_new_run_without_prompt_opens_blank_foreground_window(self, bot):
+        """`新窗口运行` without a prompt should open a blank Claude foreground window."""
+
+        bot.send("新窗口运行")
+
+        task = bot.last_task()
+        assert task is not None
+        assert task.prompt == ""
+        assert task.continue_mode is False
+        assert task.foreground is True
+        assert task.route_to_existing_foreground is False
+        assert task.open_foreground_only is True
+
+    def test_newrun_without_prompt_opens_blank_foreground_window(self, bot):
+        """`/newrun` without a prompt should match the Chinese shortcut behavior."""
+
+        bot.send("/newrun")
+
+        task = bot.last_task()
+        assert task is not None
+        assert task.prompt == ""
+        assert task.continue_mode is False
+        assert task.foreground is True
+        assert task.route_to_existing_foreground is False
+        assert task.open_foreground_only is True
+
+
+# ---------------------------------------------------------------------------
+# Approval persistence
+# ---------------------------------------------------------------------------
+
+def write_approval_state(bot: TestableBot, requests: dict[str, Any]) -> None:
+    """Persist approval requests through the real JSON file used by the bot."""
+
+    approvals_path = Path(bot.config.approvals_path)
+    approvals_path.parent.mkdir(parents=True, exist_ok=True)
+    approvals_path.write_text(
+        json.dumps({"requests": requests}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def read_approval_state(bot: TestableBot) -> dict[str, Any]:
+    """Read the approval JSON file after a simulated Feishu command."""
+
+    return json.loads(Path(bot.config.approvals_path).read_text(encoding="utf-8"))
+
+
+class TestApprovalPersistence:
+    def test_ask_user_question_selection_is_saved_to_disk(self, bot):
+        """Replying `同意 1` to a single AskUserQuestion should approve the stored request."""
+
+        request_id = "session-100"
+        question_text = "您希望如何调整前端布局？"
+        write_approval_state(
+            bot,
+            {
+                request_id: {
+                    "chat_id": CHAT_ID,
+                    "session_id": "session",
+                    "cwd": DEFAULT_CWD,
+                    "tool_name": "AskUserQuestion",
+                    "tool_input": {
+                        "questions": [
+                            {
+                                "question": question_text,
+                                "header": "布局方式",
+                                "options": [
+                                    {"label": "修改数据库配置", "description": "显示传统布局"},
+                                    {"label": "修改前端代码", "description": "强制传统布局"},
+                                ],
+                                "multiSelect": False,
+                            }
+                        ]
+                    },
+                    "status": "pending",
+                    "created_at": 100.0,
+                }
+            },
+        )
+
+        bot.send("同意 1")
+
+        saved_request = read_approval_state(bot)["requests"][request_id]
+        assert saved_request["status"] == "approved"
+        assert saved_request["updated_input"]["answers"][question_text] == "修改数据库配置"
+        assert "剩余待授权" not in bot.last_reply()
+
+    def test_indexed_non_question_approval_is_saved_to_disk(self, bot):
+        """Replying `拒绝 1` should persist the indexed approval decision."""
+
+        request_id = "session-200"
+        write_approval_state(
+            bot,
+            {
+                request_id: {
+                    "chat_id": CHAT_ID,
+                    "session_id": "session",
+                    "cwd": DEFAULT_CWD,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status", "description": "查看 Git 状态"},
+                    "status": "pending",
+                    "created_at": 200.0,
+                }
+            },
+        )
+
+        bot.send("拒绝 1")
+
+        saved_request = read_approval_state(bot)["requests"][request_id]
+        assert saved_request["status"] == "denied"
+        assert "已拒绝" in bot.last_reply()
 
 
 if __name__ == "__main__":

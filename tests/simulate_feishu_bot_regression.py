@@ -533,6 +533,14 @@ def main() -> None:
         "单独“前台运行”没有按“只打开空窗口”处理",
     )
 
+    before_queue_count = len(queued_tasks)
+    bot.handle_command(TEST_CHAT_ID, "新窗口运行")
+    assert_true(len(queued_tasks) == before_queue_count + 1, "单独“新窗口运行”没有触发开窗任务")
+    assert_true(
+        queued_tasks[-1] == (TEST_CHAT_ID, "", False, True, False, True),
+        "单独“新窗口运行”没有按“新上下文空白窗口”处理",
+    )
+
     # 11. 单独“前台运行”在 bypassPermissions 模式下也应允许开窗，并由命令参数跳过本机确认页。
     bot.state.update_chat(
         TEST_CHAT_ID,
@@ -586,6 +594,7 @@ def main() -> None:
                     "run_without_prompt_opens_foreground_window",
                     "run_without_prompt_reuses_existing_window",
                     "foreground_run_opens_blank_window_only",
+                    "new_window_run_without_prompt_opens_blank_window_only",
                     "foreground_run_allows_bypass_mode",
                     "foreground_bypass_adds_dangerous_skip_flag",
                 ],

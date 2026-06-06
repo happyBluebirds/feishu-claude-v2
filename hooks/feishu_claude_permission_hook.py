@@ -139,6 +139,8 @@ def is_bot_running(bot_script_path: Path) -> bool:
         encoding="utf-8",
         errors="replace",
         capture_output=True,
+        # 授权 hook 每次收到 PermissionRequest 都会探测 bot；隐藏 PowerShell，避免本机出现闪烁控制台。
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         check=False,
     )
     return bool((result.stdout or "").strip())

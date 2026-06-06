@@ -159,8 +159,9 @@ def resolve_chat_id_from_state(state: dict[str, Any], cwd: str, log_path: Path) 
         log_event(log_path, "resolve chat: no chats found in bot state")
         return ""
 
-    scored_matches: list[tuple[int, float, str]] = []
+    scored_matches: list[tuple[int, int, float, str]] = []
     for candidate_chat_id, chat_state in chats.items():
+        valid_receive_id = is_valid_feishu_chat_id(str(candidate_chat_id))
         status = str(chat_state.get("status", ""))
         candidate_cwd = str(chat_state.get("cwd", ""))
         started_at = float(chat_state.get("started_at") or 0)
@@ -173,14 +174,18 @@ def resolve_chat_id_from_state(state: dict[str, Any], cwd: str, log_path: Path) 
         if cwd and candidate_cwd and cwd.lower() == candidate_cwd.lower():
             score += 5
         if score > 0:
-            scored_matches.append((score, started_at, str(candidate_chat_id)))
+            # 反查阶段允许测试占位 chat_id 命中；真实发送前 main 仍会校验 oc_，避免 invalid receive_id。
+            scored_matches.append((1 if valid_receive_id else 0, score, started_at, str(candidate_chat_id)))
 
     if not scored_matches:
         latest_chat_id = ""
+        latest_valid = -1
         latest_ts = -1.0
         for candidate_chat_id, chat_state in chats.items():
+            valid_receive_id = 1 if is_valid_feishu_chat_id(str(candidate_chat_id)) else 0
             candidate_ts = float(chat_state.get("started_at") or chat_state.get("finished_at") or 0)
-            if candidate_ts >= latest_ts:
+            if valid_receive_id > latest_valid or (valid_receive_id == latest_valid and candidate_ts >= latest_ts):
+                latest_valid = valid_receive_id
                 latest_ts = candidate_ts
                 latest_chat_id = str(candidate_chat_id)
         if latest_chat_id:
@@ -188,9 +193,16 @@ def resolve_chat_id_from_state(state: dict[str, Any], cwd: str, log_path: Path) 
         return latest_chat_id
 
     scored_matches.sort(reverse=True)
-    selected_chat_id = scored_matches[0][2]
-    log_event(log_path, f"resolve chat from state chat={selected_chat_id} cwd={cwd or '-'} score={scored_matches[0][0]}")
+    selected_chat_id = scored_matches[0][3]
+    log_event(log_path, f"resolve chat from state chat={selected_chat_id} cwd={cwd or '-'} score={scored_matches[0][1]}")
     return selected_chat_id
+
+
+def is_valid_feishu_chat_id(chat_id: str) -> bool:
+    """Return whether a string can be used as Feishu receive_id_type=chat_id."""
+
+    # 飞书 chat_id 形如 oc_xxx；测试占位符或空字符串进入 OpenAPI 会导致 invalid receive_id。
+    return chat_id.startswith("oc_") and len(chat_id) > 10
 
 
 def _extract_message_id(response: CreateMessageResponse) -> str:
@@ -234,7 +246,8 @@ def send_feishu_text(app_id: str, app_secret: str, chat_id: str, text: str) -> s
         if attempt < FEISHU_SEND_RETRY_COUNT:
             # 完成通知是用户感知最强的链路，飞书 OpenAPI 偶发抖动时短重试能减少“已完成但没通知”。
             time.sleep(FEISHU_SEND_RETRY_DELAY_SECONDS)
-    raise RuntimeError(f"send message failed after retries: {last_error}")
+    # Claude hook 返回非 0 会在终端里显示 traceback；发送失败只应落空通知，不应污染本地 Claude 会话。
+    return ""
 
 
 def format_ts(value: Any) -> str:
@@ -435,6 +448,9 @@ def main() -> int:
         chat_id = resolve_chat_id_from_state(state, cwd, log_path)
     if not chat_id:
         log_event(log_path, f"skip {hook_event_name}: missing chat id cwd={cwd or '-'}")
+        return 0
+    if not is_valid_feishu_chat_id(chat_id):
+        log_event(log_path, f"skip {hook_event_name}: invalid chat id chat={chat_id} cwd={cwd or '-'}")
         return 0
 
     finished_at = time.time()
